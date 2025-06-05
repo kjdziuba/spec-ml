@@ -1,6 +1,7 @@
 numpy
 pandas
 scikit-learn
+scikit-image
 matplotlib
 seaborn
 torch
@@ -8,5 +9,7 @@ torchvision
 jupyter
 scipy
 h5py
+Pillow
 PyQt5
+umap-learn
 zarr
