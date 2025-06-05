@@ -1,0 +1,93 @@
+specML/
+│
+├── data/                     # Data storage (usually empty, version-controlled with DVC if large files)
+│   ├── raw/                   # Raw data (input files)
+│   └── processed/             # Processed data (ready for modeling)
+│
+├── examples/                  
+│   ├── basic_usage.py/                   
+│   └── preprocessing_example.py/             
+│ 
+├── figures/                  
+│
+├── notebooks/                 # Jupyter notebooks for experiments, EDA, etc.
+│   ├── exploration.ipynb      # Exploratory Data Analysis (EDA)
+│   └── model_experiments.ipynb # Model training and testing experiments
+│
+├── src/                       # Source code for the pipeline
+│   └── specml/
+│       ├── __init__.py            # Marks this folder as a package
+│       ├── data
+│       │   ├── __init__.py
+│       │   ├── loaders.py
+│       │   └── spectroscopic_data.py   # Class for data handling (e.g., SpectroscopicData)
+│       ├── processing/       
+│       │   ├── __init__.py
+│       │   ├── masking.py
+│       │   └── preprocessing.py   
+│       ├── feature_engineering/   # Feature engineering scripts
+│       │   ├── __init__.py
+│       │   └── dim_reduction.py    # PCA and dimensionality reduction
+│       ├── ml_models/                # Machine learning models
+│       │   ├── __init__.py
+│       │   ├── random_forest.py    # Random Forest and other classical models
+│       │   ├──  cnn_1d.py           # 1D CNN model (for spectroscopic data)
+│       │   ├──  clustering.py
+|       |   └── unsupervised.py
+│       ├── evaluation/            # Evaluation metrics and functions
+│       │   ├── __init__.py
+│       │   └── metrics.py          # Accuracy, confusion matrix, etc.
+|       ├── visualization/         # New folder for visualization-related functions
+|       │   ├── __init__.py
+|       │   └── plotting.py         # Plotting and visualization functions
+│       ├── utils/                 # Utility functions
+|       │   ├── agilentformats      #Loader helper
+│       │   ├── __init__.py
+│       │   └── helpers.py         # Helper functions (e.g., logging, config loading)
+|       └── gui/                     # New folder for GUI components
+│           ├── __init__.py
+│           ├── main_gui.py           # Main GUI application logic
+│           ├── widgets.py            # Separate file for specific GUI components
+│           ├── gui_plotting.py       
+│           └── gui_helpers.py        # Helper functions to assist with GUI actions
+│
+├── tests/
+|    ├── data_processing/
+|    │   └── test_spectroscopic_data.py
+|    ├── feature_engineering/
+|    │   └── test_dim_reduction.py
+|    ├── ml_models/
+|    │   ├── test_random_forest.py
+|    │   ├── test_cnn_1d.py
+|    │   └── test_unsupervised.py
+|    ├── evaluation/
+|    │   └── test_metrics.py
+|    ├── visualization/
+|    │   └── test_plotting.py
+|    ├── gui/
+|    │   └── test_gui_components.py
+|    └── utils/
+|        └── test_helpers.py
+|
+|
+├──     docs/
+|    ├── conf.py
+|    ├── index.rst
+|    ├── installation.rst
+|    ├── usage.rst
+|    └── api/
+|        └── specml.rst
+│
+├── config/                    # Configuration files for hyperparameters, paths, etc.
+│   └── config.yaml            # Config file (can also be JSON or INI)
+│
+├── scripts/                   # Command-line interface (CLI) scripts
+│   ├── run_training.py        # Script to launch model training pipeline
+│   └── preprocess_data.py     # Script for preprocessing data
+│
+├── .gitignore                 # Git ignore file (ignore sensitive or large files)
+├── requirements.txt           # Required Python packages (pip freeze > requirements.txt)
+├── README.md                  # Readme file (overview of the project, installation instructions)
+└── LICENSE                    # License file (optional, e.g., MIT License)
+├── setup.py                   # New setup file for installation
+├── setup.cfg                  # Optional config file

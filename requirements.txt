@@ -7,3 +7,6 @@ torch
 torchvision
 jupyter
 scipy
+h5py
+PyQt5
+zarr
