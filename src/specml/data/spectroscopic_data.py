@@ -15,6 +15,7 @@ from specml.ml_models.clustering import apply_clustering
 from specml.data.loaders import DataLoader
 from specml.visualization.plotting import display_image
 from specml.feature_engineering.dim_reduction import apply_pca, apply_umap
+from skimage.transform import resize
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -86,7 +87,8 @@ class SpectroscopicData:
         self.metadata = loaded_data['metadata']
         self.xpixels = self.metadata['xpixels']
         self.ypixels = self.metadata['ypixels']
-        if self.mask: self.mask = loaded_data['mask'].flatten()
+        # Always set mask from loaded data, flattening it if needed
+        self.mask = loaded_data['mask'].flatten() if loaded_data['mask'] is not None else None
         self.metadata['original_shape'] = self.data.shape
         self.data = self.flatten()
         logger.info(self.metadata)
@@ -128,10 +130,15 @@ class SpectroscopicData:
         
         # Flatten spatial dimensions (y, x) to a single dimension
         flattened_data = self.data.reshape(-1, self.data.shape[-1])  # Shape: (n_pixels, n_wavenumbers)
-        masked_data = flattened_data[self.mask]
-            
-        logger.info(f"Data flattened and mask applied. Shape of processed data: {masked_data.shape}")
-        return masked_data
+        
+        # Apply mask if it exists
+        if self.mask is not None:
+            masked_data = flattened_data[self.mask]
+            logger.info(f"Data flattened and mask applied. Shape of processed data: {masked_data.shape}")
+            return masked_data
+        else:
+            logger.info(f"Data flattened without mask. Shape of processed data: {flattened_data.shape}")
+            return flattened_data
         
     def to_image(self, data_2d: np.ndarray = None):
         """
@@ -392,10 +399,10 @@ class SpectroscopicData:
             self.mask = rebuild_tissue_mask(self, tissue_mask)
 
         # Step 4: Adjust spectra to bring each spectrum min to zero
-        self = self.adjust_min_to_zero(self.data)
+        self.data = adjust_spectra_min_to_zero(self.data)
 
         # Step 5: Perform vector normalization
-        self = self.normalize('vector')
+        self.data = vector_norm(self.data)
 
         # Step 6: Refine the wavenumber range to interest region
         # data = data.keep_range(1000,1800)
@@ -407,14 +414,9 @@ class SpectroscopicData:
         return self
 
     @inplace_method
-    def adjust_min_to_zero(self, inplace: bool = True) -> 'SpectroscopicData':
+    def adjust_min_to_zero(self) -> 'SpectroscopicData':
         """
         Adjusts each spectrum so that its minimum value is 0.
-
-        Args:
-            inplace (bool, optional): If True, modifies the data in place.
-                If False, returns a new SpectroscopicData instance.
-                If None, uses the object's default inplace setting.
 
         Returns:
             SpectroscopicData: The modified instance.
@@ -425,21 +427,33 @@ class SpectroscopicData:
         if self.data is None:
             raise ValueError("Data not loaded. Please load data before processing.")
         
-        inplace = self.inplace if inplace is None else inplace
-        adjusted_data = adjust_spectra_min_to_zero(self.data)
-
+        self.data = adjust_spectra_min_to_zero(self.data)
         return self
 
     @inplace_method  
-    def normalize(self, method: str = 'vector', inplace: bool = True) -> 'SpectroscopicData':
+    def normalize(self, method: str = 'vector') -> 'SpectroscopicData':
+        """
+        Normalizes the spectroscopic data using the specified method.
+
+        Args:
+            method (str): Normalization method ('vector' or 'z_score'). Default is 'vector'.
+
+        Returns:
+            SpectroscopicData: The modified instance.
+
+        Raises:
+            ValueError: If method is unknown or data is not loaded.
+        """
+        if self.data is None:
+            raise ValueError("Data not loaded. Please load data before processing.")
+            
         if method == 'vector':
-            normalized_data = vector_norm(self.data)
+            self.data = vector_norm(self.data)
         elif method == 'z_score':
-            normalized_data = z_score_normalize(self.data)
+            self.data = z_score_normalize(self.data)
         else:
             raise ValueError(f"Unknown normalization method: {method}")
-
-        self.data = normalized_data
+            
         return self  
 
     @inplace_method
@@ -476,13 +490,21 @@ class SpectroscopicData:
         return self.apply_derivative(window_length, polyorder, deriv=0, interp=interp)
 
     @inplace_method
-    def mean_center(self, inplace: bool = True) -> 'SpectroscopicData':
-        centered_data = mean_center(self.data)
-        if inplace:
-            self.data = centered_data
-            return self
-        else:
-            return self.from_existing(new_data=centered_data)
+    def mean_center(self) -> 'SpectroscopicData':
+        """
+        Mean-centers the spectroscopic data.
+
+        Returns:
+            SpectroscopicData: The modified instance.
+
+        Raises:
+            ValueError: If data is not loaded.
+        """
+        if self.data is None:
+            raise ValueError("Data not loaded. Please load data before processing.")
+            
+        self.data = mean_center(self.data)
+        return self
 
 
     def cluster_data(self, clustering_algorithm):
@@ -530,7 +552,6 @@ class SpectroscopicData:
         return apply_pca(self, n_components, scale_data, random_state)
 
 
-    from skimage.transform import resize
     def resize_spatial(self, target_h: int, target_w: int, 
                     preserve_range=True, anti_aliasing=True, 
                     mode='reflect'):
@@ -593,7 +614,6 @@ class SpectroscopicData:
 
         return self
 
-   # Assuming this is a method within the SpectroscopicData class
     def pad_or_cut_spatial(self, target_h: int, target_w: int, corner='center') -> 'SpectroscopicData':
         """
         Pads or cuts the spectral image data AND its corresponding mask
@@ -602,7 +622,7 @@ class SpectroscopicData:
         Args:
             target_h (int): Desired spatial height.
             target_w (int): Desired spatial width.
-            corner (str): Cropping corner ('top-left' or 'center').
+            corner (str): Cropping/padding positioning ('top-left' or 'center').
 
         Returns:
             SpectroscopicData: Self (inplace).
@@ -612,33 +632,22 @@ class SpectroscopicData:
         H, W, n_channels = data_3d.shape
 
         # Get current mask and reshape to 2D (H, W)
-        # Assuming self.mask is currently flattened bool array or already 2D
         if hasattr(self, 'mask') and self.mask is not None:
-             try:
-                 current_mask_2d = self.mask.reshape(H, W)
-             except ValueError:
-                  # Handle case where mask might already be 2D or has unexpected shape
-                  if self.mask.shape == (H, W):
-                      current_mask_2d = self.mask
-                  else:
-                      logging.warning(f"Could not reshape mask with shape {self.mask.shape} to ({H}, {W}). Generating default mask.")
-                      # Fallback: create a mask of ones if reshape fails? Or raise error?
-                      # Let's try to use original H, W from metadata if possible
-                      try:
-                          orig_h, orig_w = self.metadata['info']['ypixels'], self.metadata['info']['xpixels']
-                          current_mask_2d = self.mask.reshape(orig_h, orig_w)
-                          if current_mask_2d.shape != (H,W): # If metadata size differs from data size after processing
-                               raise ValueError("Metadata size mismatch")
-                      except Exception:
-                           logging.error(f"Mask reshaping failed definitively. Cannot process mask for pad/cut.")
-                           current_mask_2d = np.ones((H,W), dtype=bool) # Fallback, less ideal
-
+            try:
+                current_mask_2d = self.mask.reshape(H, W)
+            except ValueError:
+                # Handle case where mask might already be 2D or has unexpected shape
+                if self.mask.shape == (H, W):
+                    current_mask_2d = self.mask
+                else:
+                    logging.warning(f"Could not reshape mask with shape {self.mask.shape} to ({H}, {W}). Generating default mask.")
+                    current_mask_2d = np.ones((H, W), dtype=bool) # Fallback
         else:
             logging.warning("No mask found before pad/cut. Creating default mask of ones.")
             current_mask_2d = np.ones((H, W), dtype=bool) # Create default if no mask exists
 
         if corner not in ('top-left', 'center'):
-            raise ValueError("Currently corner must be 'top-left' or 'center'.")
+            raise ValueError("Corner must be 'top-left' or 'center'.")
 
         # --- 1) Crop Data and Mask if bigger ---
         crop_h = min(H, target_h)
@@ -657,15 +666,19 @@ class SpectroscopicData:
         final_h = target_h
         final_w = target_w
 
-        # Pad data
+        # Initialize padded arrays
         padded_data_3d = np.zeros((final_h, final_w, n_channels), dtype=cropped_data_3d.dtype)
-        # Pad mask (initialize with False - background)
-        padded_mask_2d = np.zeros((final_h, final_w), dtype=bool)
+        padded_mask_2d = np.zeros((final_h, final_w), dtype=bool) # Initialize with False (background)
 
-        # Placement logic (same for data and mask)
-        # Example: Center placement during padding
-        pad_start_h = (final_h - crop_h) // 2
-        pad_start_w = (final_w - crop_w) // 2
+        # Placement logic for padding
+        if corner == 'top-left':
+            pad_start_h = 0
+            pad_start_w = 0
+        elif corner == 'center':
+            pad_start_h = (final_h - crop_h) // 2
+            pad_start_w = (final_w - crop_w) // 2
+        
+        # Place cropped data and mask in padded arrays
         padded_data_3d[pad_start_h:pad_start_h + crop_h, pad_start_w:pad_start_w + crop_w, :] = cropped_data_3d
         padded_mask_2d[pad_start_h:pad_start_h + crop_h, pad_start_w:pad_start_w + crop_w] = cropped_mask_2d
 
@@ -676,7 +689,8 @@ class SpectroscopicData:
         # Update metadata
         self.xpixels = final_w
         self.ypixels = final_h
-        if 'info' not in self.metadata: self.metadata['info'] = {}
+        if 'info' not in self.metadata: 
+            self.metadata['info'] = {}
         self.metadata['info']['xpixels'] = final_w
         self.metadata['info']['ypixels'] = final_h
 
@@ -796,4 +810,44 @@ class SpectroscopicData:
         new_instance.xpixels = self.xpixels
         new_instance.ypixels = self.ypixels
         new_instance.labels = labels if labels is not None else (self.labels.copy() if self.labels is not None else None)
+        return new_instance
+    
+    def from_quality_control(self, clean_data, valid_indices) -> 'SpectroscopicData':
+        """
+        Creates a new SpectroscopicData instance after quality control.
+        
+        Args:
+            clean_data (np.ndarray): The cleaned spectral data
+            valid_indices (np.ndarray): Boolean mask or indices of valid spectra from original data
+            
+        Returns:
+            SpectroscopicData: New instance with updated mask reflecting spatial locations
+        """
+        new_instance = SpectroscopicData(inplace=self.inplace)
+        new_instance.data = clean_data
+        new_instance.wavenumbers = self.wavenumbers.copy()
+        new_instance.xpixels = self.xpixels
+        new_instance.ypixels = self.ypixels
+        new_instance.metadata = self.metadata.copy() if hasattr(self.metadata, 'copy') else self.metadata
+        new_instance.labels = self.labels.copy() if self.labels is not None and hasattr(self.labels, 'copy') else self.labels
+        
+        # Create new mask that reflects which spatial pixels are still valid
+        # Start with the original mask to get spatial pixel locations
+        original_valid_pixels = np.where(self.mask)[0]  # Spatial indices of originally valid pixels
+        
+        # Convert valid_indices to boolean if needed
+        if hasattr(valid_indices, 'dtype') and valid_indices.dtype == bool:
+            final_valid_spectra = valid_indices
+        else:
+            final_valid_spectra = np.zeros(self.data.shape[0], dtype=bool)
+            final_valid_spectra[valid_indices] = True
+        
+        # Map back to spatial coordinates
+        final_valid_pixels = original_valid_pixels[final_valid_spectra]
+        
+        # Create new mask for the full spatial array
+        new_mask = np.zeros(int(self.xpixels) * int(self.ypixels), dtype=bool)
+        new_mask[final_valid_pixels] = True
+        new_instance.mask = new_mask
+        
         return new_instance
