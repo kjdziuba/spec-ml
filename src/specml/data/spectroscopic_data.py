@@ -84,9 +84,9 @@ class SpectroscopicData:
         
         self.data = loaded_data['data']
         self.wavenumbers = loaded_data['wavenumbers']
-        self.metadata = loaded_data['metadata']
-        self.xpixels = self.metadata['xpixels']
-        self.ypixels = self.metadata['ypixels']
+        self.metadata = {'info': loaded_data['metadata']}
+        self.xpixels = self.metadata['info']['xpixels']
+        self.ypixels = self.metadata['info']['ypixels']
         # Always set mask from loaded data, flattening it if needed
         self.mask = loaded_data['mask'].flatten() if loaded_data['mask'] is not None else None
         self.metadata['original_shape'] = self.data.shape

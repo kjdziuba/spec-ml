@@ -2,7 +2,6 @@ import numpy as np
 import scipy.sparse
 from scipy.signal import savgol_filter
 from scipy.ndimage import gaussian_filter
-from scipy.linalg import solveh_banded
 
 def adjust_spectra_min_to_zero(data):
     """
@@ -121,7 +120,7 @@ def baseline_correction(data, lam=10000, p=0.01, niter=10):
     :param lam: Smoothing parameter.
     :param p: Asymmetry parameter.
     :param niter: Number of iterations.
-    :returns: Baseline-co   rrected data.
+    :returns: Baseline-corrected data.
     """
     def baseline(y, lam, p, niter):
         L = len(y)

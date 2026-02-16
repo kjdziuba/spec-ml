@@ -16,11 +16,10 @@ def apply_pca(spectro_data, n_components=2, scale_data=False):
     :returns: DimReductionResult object.
     """
 
-    if scale_data:
-        data = MinMaxScaler().fit_transform(spectro_data.data)
+    data = MinMaxScaler().fit_transform(spectro_data.data) if scale_data else spectro_data.data
 
     pca = PCA(n_components=n_components)
-    pca_data = pca.fit_transform(spectro_data.data)
+    pca_data = pca.fit_transform(data)
     return PCAResult(pca_data, spectro_data.mask, spectro_data.wavenumbers, (spectro_data.ypixels, spectro_data.xpixels), model=pca, labels=spectro_data.labels)
 
 
@@ -36,11 +35,10 @@ def apply_umap(spectro_data, n_components=2, scale_data=False, random_state=None
     """
     # data = spectro_data.flatten()
 
-    if scale_data:
-        data = MinMaxScaler().fit_transform(spectro_data.data)
+    data = MinMaxScaler().fit_transform(spectro_data.data) if scale_data else spectro_data.data
 
     reducer = umap.UMAP(n_components=n_components, random_state=random_state)
-    umap_data = reducer.fit_transform(spectro_data.data)
+    umap_data = reducer.fit_transform(data)
     return UMAPResult(umap_data, spectro_data.mask, spectro_data.wavenumbers, (spectro_data.ypixels, spectro_data.xpixels), model=reducer)
 
 

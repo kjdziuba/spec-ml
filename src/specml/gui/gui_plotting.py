@@ -40,8 +40,6 @@ def plot_image_over_wavenumber_gui(spec_data_obj, target_wavenumber=None, wavenu
 
 
 
-from matplotlib import pyplot as plt
-
 def plot_dim_reduction_result(dim_result, labels=None, ax=None, cmap='viridis'):
     """
     Plots the results of a 2D dimensionality reduction (e.g., PCA, UMAP) with optional clustering labels.
