@@ -351,6 +351,77 @@ def rmies_emsc_correction(data, wavenumbers, n_iterations=10, reference_spectrum
     logger.info(f"Applied RMieS-EMSC correction ({n_iterations} iterations)")
     return corrected_data
 
+def me_emsc_correction(data, wavenumbers, reference=None, options=None,
+                       return_residuals=False):
+    """
+    ME-EMSC (Mie Extinction EMSC) correction — Konevskikh et al. 2016.
+
+    The proper Mie-scattering correction for IR spectra of cells and thin
+    tissue. It builds an EMSC interferent basis from a database of Mie
+    extinction curves Q_ext(nu; a, n) over a grid of sphere radii and
+    refractive indices, then iteratively fits that basis out of each
+    spectrum. This is what you want when you see scatter-induced baseline
+    ripples or distorted amide I band shapes that vector normalisation
+    cannot fix.
+
+    Wraps the vendored port of Solheim/Konevskikh's BioSpecNorway ME-EMSC,
+    based on Dougal Ferguson's `ME_EMSC_Python` (MIT). See
+    `specml/processing/me_emsc/` for the algorithm itself.
+
+    Args:
+        data (np.ndarray): Spectral data, shape (n_samples, n_wavenumbers).
+        wavenumbers (np.ndarray): Wavenumber axis (cm^-1).
+        reference (np.ndarray, optional): Clean reference spectrum on the
+            same wavenumber axis (e.g. Matrigel, casein, or a flat
+            scatter-free tissue region). If None, the dataset mean is used
+            — works, but a real reference is much better.
+        options (dict, optional): ME-EMSC options forwarded to the underlying
+            algorithm. Sensible keys (and defaults if omitted):
+                'maxIterationNumber'  : 45
+                'PCnumber'            : False  (auto from explained variance)
+                'ExplainedVariance'   : 99.96
+                'minRadius', 'maxRadius'             : 2, 7.1   (μm)
+                'minRefractiveIndex', 'maxRefractiveIndex' : 1.1, 1.4
+                'samplingSteps'       : 10
+                'h'                   : 0.25
+                'Weights'             : True
+        return_residuals (bool): If True, also return RMSE residuals per
+            spectrum (useful for quality-control filtering).
+
+    Returns:
+        np.ndarray: Corrected data, same shape as input. If
+            `return_residuals=True`, returns `(corrected, rmse)`.
+    """
+    from specml.processing.me_emsc import ME_EMSC
+
+    if reference is None:
+        reference = np.mean(data, axis=0)
+        logger.warning(
+            "No reference provided for ME-EMSC; using dataset mean. "
+            "Pass a clean reference (Matrigel, casein, etc.) for better results."
+        )
+
+    # ME-EMSC expects the reference as a (1, n_wn) row, spectra as (n, n_wn),
+    # and wavenumbers as a 1D array.
+    reference = np.asarray(reference).reshape(1, -1)
+    data = np.asarray(data)
+    wn = np.asarray(wavenumbers).flatten()
+
+    # Min-to-zero on the reference so the iterative correction is well-posed.
+    reference = reference - np.min(reference)
+
+    opts = dict(options) if options else {}
+    corrected, residuals, _params, _n_iters, _opts = ME_EMSC(
+        reference, data, wn, opts
+    )
+
+    logger.info("Applied ME-EMSC correction")
+
+    if return_residuals:
+        rmse = np.sqrt(np.mean(residuals ** 2, axis=1))
+        return corrected, rmse
+    return corrected
+
 def kmeans_tissue_wax_separation(data, wavenumbers, n_clusters=3, amide_range=(1600, 1700)):
     """
     K-means tissue/wax separation using integrated Amide I band.

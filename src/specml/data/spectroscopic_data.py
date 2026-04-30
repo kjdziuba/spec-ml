@@ -11,6 +11,7 @@ from specml.processing.preprocessing import  (
                                                 mean_center,
                                                 baseline_correction,
                                                 z_score_normalize)
+from specml.processing.advanced_preprocessing import me_emsc_correction
 from specml.ml_models.clustering import apply_clustering
 from specml.data.loaders import DataLoader
 from specml.visualization.plotting import display_image
@@ -488,6 +489,53 @@ class SpectroscopicData:
                            If False, trims the data to remove edge effects. Default is False.
         """
         return self.apply_derivative(window_length, polyorder, deriv=0, interp=interp)
+
+    @inplace_method
+    def apply_me_emsc(self, reference=None, options=None,
+                      return_residuals: bool = False) -> 'SpectroscopicData':
+        """
+        Applies ME-EMSC (Mie Extinction EMSC, Konevskikh 2016) scattering
+        correction.
+
+        Use this when vector normalisation cannot fix scatter-induced baseline
+        ripples or distorted amide I/II band shapes — typical of single-cell
+        and thin-tissue IR spectra. ME-EMSC is iterative and slow; expect
+        seconds to minutes per ~1000 spectra.
+
+        Args:
+            reference (np.ndarray, optional): Clean reference spectrum on the
+                same wavenumber axis (e.g. Matrigel, casein, or a flat
+                scatter-free tissue region). If None, the dataset mean is
+                used — works, but a real reference is much better.
+            options (dict, optional): Forwarded to the underlying ME_EMSC
+                algorithm. Sensible keys (with defaults):
+                    'maxIterationNumber'  : 45
+                    'PCnumber'            : False  (auto from explained variance)
+                    'ExplainedVariance'   : 99.96
+                    'minRadius', 'maxRadius'             : 2, 7.1   (μm)
+                    'minRefractiveIndex', 'maxRefractiveIndex' : 1.1, 1.4
+                    'samplingSteps'       : 10
+                    'h'                   : 0.25
+                    'Weights'             : True
+            return_residuals (bool): If True, stores the per-spectrum RMSE
+                residuals on `self.me_emsc_rmse` for quality control.
+
+        Returns:
+            SpectroscopicData: The modified instance.
+        """
+        if self.data is None:
+            raise ValueError("Data not loaded. Please load data before processing.")
+
+        result = me_emsc_correction(
+            self.data, self.wavenumbers,
+            reference=reference, options=options,
+            return_residuals=return_residuals,
+        )
+        if return_residuals:
+            self.data, self.me_emsc_rmse = result
+        else:
+            self.data = result
+        return self
 
     @inplace_method
     def mean_center(self) -> 'SpectroscopicData':
