@@ -9,7 +9,6 @@ import os
 from PIL import Image
 import zarr
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class DataLoader:
@@ -176,38 +175,100 @@ class DataLoader:
         return labels_numeric, numeric_label_mapping
 
 class ZarrReader:
+    """Reads QCL/IR hypercube data from a Zarr directory.
+
+    Two layouts are supported:
+
+    * **Pyramid** (rat-lung QCL output)::
+
+          <store>/0/hypercube   shape (y, x, n_wavenumbers)
+          <store>/0/wvnm        shape (n_wavenumbers,)
+          <store>/0/mask        shape (y, x)            # optional
+
+    * **Flat** (earlier exports / breast tokenisation)::
+
+          <store>/qcl_data      shape (y, x, n_wavenumbers)
+          <store>/wavenumbers   shape (n_wavenumbers,)
+          <store>/mask          shape (y, x)            # optional
+
+    The loader auto-detects which layout is present and reads accordingly.
+    Output shape is always ``(y, x, wavenumbers)`` — the same convention the
+    Agilent mosaic path produces after its transpose in
+    :py:meth:`DataLoader.load_data`.
+    """
+
+    HYPERCUBE_KEYS = ("hypercube", "qcl_data")
+    WAVENUMBER_KEYS = ("wvnm", "wavenumbers")
+
     def read(self, file_path):
-        """
-        Reads data from a Zarr directory.
+        zarr_group = zarr.open(file_path, mode="r")
+        sub = self._select_subgroup(zarr_group)
 
-        :param file_path: Path to the Zarr directory.
-        :return: Dictionary containing data, wavenumbers, mask, and metadata.
-        """
-        zarr_group = zarr.open(file_path, mode='r')
-        data = np.array(zarr_group['qcl_data'])        # Spectral data
-        wavenumbers = np.array(zarr_group['wavenumbers'])  # Wavenumbers
+        data = self._load_required(sub, self.HYPERCUBE_KEYS, file_path, "hypercube")
+        wavenumbers = self._load_required(sub, self.WAVENUMBER_KEYS, file_path, "wavenumbers")
+        wavenumbers = np.asarray(wavenumbers, dtype=np.float64).ravel()
 
-        # Handle mask if available
-        if 'mask' in zarr_group:
-            mask = np.array(zarr_group['mask'])
+        if data.ndim != 3:
+            raise ValueError(
+                f"Zarr at {file_path}: expected 3-D hypercube (y, x, wavenumbers), "
+                f"got shape {data.shape}."
+            )
+        if data.shape[-1] != wavenumbers.size:
+            raise ValueError(
+                f"Zarr at {file_path}: hypercube last axis ({data.shape[-1]}) "
+                f"does not match wavenumber count ({wavenumbers.size})."
+            )
+
+        ypixels, xpixels = int(data.shape[0]), int(data.shape[1])
+        if "mask" in sub:
+            raw_mask = np.asarray(sub["mask"])
+            if raw_mask.shape != (ypixels, xpixels):
+                raise ValueError(
+                    f"Zarr at {file_path}: mask shape {raw_mask.shape} does not match "
+                    f"hypercube spatial shape ({ypixels}, {xpixels})."
+                )
+            mask = raw_mask.astype(bool)
         else:
-            ypixels, xpixels = data.shape[:2]
-            mask = np.ones((ypixels, xpixels), dtype=bool)  # Assume mask is all True
+            mask = np.ones((ypixels, xpixels), dtype=bool)
 
-        # Collect metadata if available
-        metadata = {}
-        if 'metadata' in zarr_group:
-            # Assuming metadata is stored as a dictionary
-            metadata = dict(zarr_group['metadata'])
-        else:
-            # You can add default metadata or extract from data
-            ypixels, xpixels = data.shape[:2]
-            metadata['ypixels'] = ypixels
-            metadata['xpixels'] = xpixels
+        # Prefer subgroup attrs; fall back to root attrs. Always inject pixel sizes.
+        metadata = dict(sub.attrs) if sub.attrs else {}
+        if not metadata and sub is not zarr_group:
+            metadata = dict(zarr_group.attrs)
+        metadata.setdefault("xpixels", xpixels)
+        metadata.setdefault("ypixels", ypixels)
 
         return {
-            'data': data,
-            'wavenumbers': wavenumbers,
-            'mask': mask,
-            'metadata': metadata
+            "data": data,
+            "wavenumbers": wavenumbers,
+            "mask": mask,
+            "metadata": metadata,
         }
+
+    def _select_subgroup(self, zarr_group):
+        """Descend into the first numeric subgroup that holds a hypercube.
+
+        Pyramid Zarrs (produced by the rat-lung QCL pipeline) wrap each
+        resolution level under a numeric key — e.g. ``/0`` for the full-res
+        cube. If the root looks empty but ``/0`` holds the data, descend.
+        Otherwise stay at the root for flat-layout files.
+        """
+        root_has_cube = any(k in zarr_group for k in self.HYPERCUBE_KEYS)
+        if root_has_cube:
+            return zarr_group
+        for level_key in ("0", "1", "2"):
+            if level_key in zarr_group and any(
+                k in zarr_group[level_key] for k in self.HYPERCUBE_KEYS
+            ):
+                return zarr_group[level_key]
+        return zarr_group
+
+    @staticmethod
+    def _load_required(grp, keys, file_path, what):
+        for key in keys:
+            if key in grp:
+                return np.asarray(grp[key])
+        raise KeyError(
+            f"Zarr at {file_path}: no {what} dataset found. "
+            f"Tried keys {list(keys)}; present keys are {list(grp)}."
+        )

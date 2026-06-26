@@ -1,9 +1,14 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
-import scipy.integrate as sci_int
+from scipy.integrate import simpson, trapezoid
 from specml.utils.helpers import arg_size_checker, get_wavenumber_indices
-from specml.processing.masking import create_mask_from_area, apply_mask, rebuild_tissue_mask
+from specml.processing.masking import (
+    apply_mask,
+    clean_tissue_mask_spatial,
+    create_mask_from_area,
+    rebuild_tissue_mask,
+)
 from specml.processing.preprocessing import  (
                                                 adjust_spectra_min_to_zero,
                                                 vector_norm,
@@ -19,7 +24,6 @@ from specml.feature_engineering.dim_reduction import apply_pca, apply_umap
 from skimage.transform import resize
 
 import logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def inplace_method(func):
@@ -33,6 +37,29 @@ def inplace_method(func):
             new_instance = self.from_existing()
             return func(new_instance, *args, **kwargs)
     return wrapper
+
+
+def _copy_or_none(value):
+    """Return a copy of ``value`` if it supports ``.copy()``, else ``None``."""
+    if value is None:
+        return None
+    return value.copy() if hasattr(value, "copy") else value
+
+
+def _normalise_metadata(metadata):
+    """Coerce metadata to the canonical ``{'info': {...}}`` nested form.
+
+    Loaders historically returned the flat dict (``{'xpixels': N, ...}``)
+    or the nested form (``{'info': {'xpixels': N, ...}}``). Constructors,
+    ``combine()`` and downstream code expect nested. This helper accepts
+    both and always yields nested, so a hand-built test fixture with a
+    flat dict no longer crashes :py:meth:`SpectroscopicData.__init__`.
+    """
+    if not metadata:
+        return {'info': {}}
+    if 'info' in metadata:
+        return dict(metadata)
+    return {'info': dict(metadata)}
 
 class SpectroscopicData:
     """
@@ -48,17 +75,17 @@ class SpectroscopicData:
         labels (np.ndarray): Labels for the data, if any.
     """
 
-    def __init__(self, file_path = None, inplace = True, data = None, wavenumbers = None, mask = None,
-                metadata = None, labels = None, label_mapping=None, 
-                annotations = None, type_of_data = None):
+    def __init__(self, file_path=None, inplace=True, data=None, wavenumbers=None, mask=None,
+                 metadata=None, labels=None, label_mapping=None,
+                 annotations=None, type_of_data=None):
         self.file_path = file_path
         self.data = data
         self.wavenumbers = wavenumbers
         self.mask = mask
-        self.metadata = metadata or {}
-        if self.metadata:
-            self.xpixels = self.metadata['info']['xpixels']
-            self.ypixels = self.metadata['info']['ypixels']
+        self.metadata = _normalise_metadata(metadata)
+        info = self.metadata.get('info', {})
+        self.xpixels = info.get('xpixels')
+        self.ypixels = info.get('ypixels')
         self.labels = labels
         self.label_mapping = label_mapping or {}  # Mapping from numeric labels to class names
         self.annotations = annotations
@@ -85,9 +112,10 @@ class SpectroscopicData:
         
         self.data = loaded_data['data']
         self.wavenumbers = loaded_data['wavenumbers']
-        self.metadata = {'info': loaded_data['metadata']}
-        self.xpixels = self.metadata['info']['xpixels']
-        self.ypixels = self.metadata['info']['ypixels']
+        self.metadata = _normalise_metadata(loaded_data['metadata'])
+        info = self.metadata['info']
+        self.xpixels = info['xpixels']
+        self.ypixels = info['ypixels']
         # Always set mask from loaded data, flattening it if needed
         self.mask = loaded_data['mask'].flatten() if loaded_data['mask'] is not None else None
         self.metadata['original_shape'] = self.data.shape
@@ -326,92 +354,201 @@ class SpectroscopicData:
         spectral_range = adjust_spectra_min_to_zero(spectral_range)
         wavenumber_range = wavenums[lower_loc:upper_loc]
 
-        # Step 6: Calculate the area using the chosen integration method
-        if method == 'trapezoid' or method == 'trapz':
-            areas = np.trapz(spectral_range, x=wavenumber_range, axis=1, **kwargs)
-        elif method == 'simpson':
-            areas = sci_int.simps(spectral_range, x=wavenumber_range, axis=1, **kwargs)
+        # Step 6: Calculate the area using the chosen integration method.
+        # Accept both modern ('trapezoid'/'simpson') and legacy ('trapz'/'simps')
+        # names for backwards compatibility with older configs.
+        if method in ('trapezoid', 'trapz'):
+            areas = trapezoid(spectral_range, x=wavenumber_range, axis=1, **kwargs)
+        elif method in ('simpson', 'simps'):
+            areas = simpson(spectral_range, x=wavenumber_range, axis=1, **kwargs)
         else:
             raise ValueError(f"Unknown method: {method}. Use 'trapezoid' or 'simpson'.")
         
         return areas.reshape(self.data.shape[0], self.data.shape[1]) if self.data.ndim == 3 else areas
     
     @inplace_method
-    def easy_preprocess(self, wavenumber_range=(1000, 1800), area_range=(1600, 1700), enable_mask=True, area_threshold=1.5, deriv = 0):
+    def easy_preprocess(
+        self,
+        wavenumber_range=(1000, 1800),
+        area_range=(1600, 1700),
+        enable_mask=True,
+        area_threshold=1.5,
+        deriv=0,
+        *,
+        integration='simpson',
+        sg_window=23,
+        sg_polyorder=5,
+        sg_interp=False,
+        wax_ranges=((1350, 1490), (2300, 2400), (2700, 3000)),
+        co2_range=(2250, 2450),
+        min_to_zero=True,
+        vector_normalize=True,
+        mask_min_size_px=None,
+        mask_closing_radius_px=0,
+    ):
+        """Preprocess a FTIR cube with the standard rat-lung baseline pipeline.
+
+        Order of operations (carried over from the 2025 pipeline, but every
+        step is now optional / parameterised so the rat-lung YAML can drive
+        the same call):
+
+        1. Crop to a wide range (950–3550 cm⁻¹) to discard scan edges.
+        2. Remove paraffin/wax gaps (default: 1350–1490, 2300–2400, 2700–3000).
+        3. Remove CO₂ band (default: 2250–2450).
+        4. Compute Amide-I (default) integrated area and threshold to build
+           a tissue mask. Optional spatial cleanup via ``mask_min_size_px``.
+        5. Subtract the per-spectrum minimum (``adjust_spectra_min_to_zero``).
+        6. Vector-normalise each spectrum.
+        7. Crop to the wavenumber range of interest (default 1000–1800).
+        8. Optionally apply a Savitzky-Golay derivative.
+
+        All wavenumber ranges are given as ``(low_cm1, high_cm1)`` tuples;
+        the internal ``remove_range`` call still takes ``(upper, lower)``.
+
+        Args:
+            wavenumber_range: Final spectral range of interest, ``(low, high)``.
+            area_range: Band over which to integrate to build the tissue mask.
+            enable_mask: If False, skips the area-threshold tissue mask step.
+            area_threshold: Threshold on integrated area for the tissue mask.
+            deriv: Derivative order (0 = none). Use a YAML-driven pipeline
+                helper if you need multiple derivatives stacked.
+            integration: ``'simpson'`` (default) or ``'trapezoid'`` for area.
+            sg_window: SG window length (forced to odd internally).
+            sg_polyorder: SG polynomial order.
+            sg_interp: Pass-through to ``apply_savitzky_golay``.
+            wax_ranges: Iterable of ``(low, high)`` wavenumber ranges to
+                excise as wax/paraffin contamination. Pass ``()`` to skip.
+            co2_range: ``(low, high)`` wavenumber range to excise as CO₂.
+                Pass ``None`` to skip.
+            min_to_zero: If True, runs ``adjust_spectra_min_to_zero``.
+            vector_normalize: If True, runs ``vector_norm``.
+            mask_min_size_px: Minimum connected-component size (in pixels)
+                kept by the tissue mask. ``None`` disables this clean-up.
+            mask_closing_radius_px: If > 0, runs a morphological closing on
+                the rebuilt 2-D mask before flattening it back.
         """
-        Preprocess the spectroscopic data with a predefined pipeline.
-        
-        :param wavenumber_range: Tuple specifying the lower and upper wavenumber limits to keep.
-        :param area_range: Tuple specifying the wavenumber limits for area calculation.
-        :param area_threshold: Threshold for creating a mask from the calculated area.
-        
-        :returns: Preprocessed SpectroscopicData object
-        """
-        # Step 1: Refine the wavenumber range to 1000, 3500, wax and co2
-        self = self.keep_range(950, 3550)
-        self = self.remove_wax()
-        self = self.remove_co2()
+        return self._run_baseline_pipeline(
+            wavenumber_range=wavenumber_range,
+            area_range=area_range,
+            enable_mask=enable_mask,
+            area_threshold=area_threshold,
+            deriv=deriv,
+            integration=integration,
+            sg_window=sg_window,
+            sg_polyorder=sg_polyorder,
+            sg_interp=sg_interp,
+            wax_ranges=wax_ranges,
+            co2_range=co2_range,
+            min_to_zero=min_to_zero,
+            vector_normalize=vector_normalize,
+            mask_min_size_px=mask_min_size_px,
+            mask_closing_radius_px=mask_closing_radius_px,
+            initial_keep_range=(950, 3550),
+        )
 
-        # Step 2: Calculate the area under the spectral range
-        area = self.calculate_area(*area_range)
-
-        if enable_mask:
-            # Step 3: Create mask based on area and apply it
-            tissue_mask = create_mask_from_area(area=area, threshold=area_threshold)
-            self.data = apply_mask(self.data, tissue_mask)
-            self.mask = rebuild_tissue_mask(self, tissue_mask)
-
-        # Step 4: Adjust spectra to bring each spectrum min to zero
-        self.data = adjust_spectra_min_to_zero(self.data)
-
-        # Step 5: Perform vector normalization
-        self.data = vector_norm(self.data)
-
-        # Step 6: Refine the wavenumber range to interest region
-        self = self.keep_range(*wavenumber_range)
-
-        # Step 7: Apply Savitzky-Golay derivative filter
-        if deriv > 0:
-            self = self.apply_derivative(deriv=deriv)
-
-        return self
-    
     @inplace_method
-    def preprocess_qcl(self, area_range=(1600, 1700), enable_mask=True, area_threshold=1.5, deriv = 0):
-        """
-        Preprocess the spectroscopic data with a predefined pipeline.
-        
-        :param wavenumber_range: Tuple specifying the lower and upper wavenumber limits to keep.
-        :param area_range: Tuple specifying the wavenumber limits for area calculation.
-        :param area_threshold: Threshold for creating a mask from the calculated area.
-        
-        :returns: Preprocessed SpectroscopicData object
-        """
-        # Step 1: remove wax
-        self = self.remove_range(1490, 1350)
+    def preprocess_qcl(
+        self,
+        area_range=(1600, 1700),
+        enable_mask=True,
+        area_threshold=1.5,
+        deriv=0,
+        *,
+        wavenumber_range=None,
+        integration='simpson',
+        sg_window=23,
+        sg_polyorder=5,
+        sg_interp=False,
+        wax_ranges=((1350, 1490),),
+        co2_range=None,
+        min_to_zero=True,
+        vector_normalize=True,
+        mask_min_size_px=None,
+        mask_closing_radius_px=0,
+    ):
+        """Preprocess a QCL cube. Same pipeline as ``easy_preprocess`` but:
 
-        # Step 2: Calculate the area under the spectral range
-        area = self.calculate_area(*area_range)
+        * skips the wide initial crop (QCL data is already in band);
+        * removes only the paraffin gap by default;
+        * does not remove CO₂ (out of QCL spectral range);
+        * leaves ``wavenumber_range`` to the caller (``None`` = no final crop).
+        """
+        return self._run_baseline_pipeline(
+            wavenumber_range=wavenumber_range,
+            area_range=area_range,
+            enable_mask=enable_mask,
+            area_threshold=area_threshold,
+            deriv=deriv,
+            integration=integration,
+            sg_window=sg_window,
+            sg_polyorder=sg_polyorder,
+            sg_interp=sg_interp,
+            wax_ranges=wax_ranges,
+            co2_range=co2_range,
+            min_to_zero=min_to_zero,
+            vector_normalize=vector_normalize,
+            mask_min_size_px=mask_min_size_px,
+            mask_closing_radius_px=mask_closing_radius_px,
+            initial_keep_range=None,
+        )
+
+    def _run_baseline_pipeline(
+        self,
+        *,
+        wavenumber_range,
+        area_range,
+        enable_mask,
+        area_threshold,
+        deriv,
+        integration,
+        sg_window,
+        sg_polyorder,
+        sg_interp,
+        wax_ranges,
+        co2_range,
+        min_to_zero,
+        vector_normalize,
+        mask_min_size_px,
+        mask_closing_radius_px,
+        initial_keep_range,
+    ):
+        # Shared body for easy_preprocess + preprocess_qcl.
+        if initial_keep_range is not None:
+            self = self.keep_range(*initial_keep_range)
+        for low, high in wax_ranges:
+            self = self.remove_range(high, low)
+        if co2_range is not None:
+            self = self.remove_range(co2_range[1], co2_range[0])
 
         if enable_mask:
-            # Step 3: Create mask based on area and apply it
+            area = self.calculate_area(*area_range, method=integration)
             tissue_mask = create_mask_from_area(area=area, threshold=area_threshold)
             self.data = apply_mask(self.data, tissue_mask)
             self.mask = rebuild_tissue_mask(self, tissue_mask)
+            if mask_min_size_px or mask_closing_radius_px:
+                self.mask = clean_tissue_mask_spatial(
+                    self.mask,
+                    self.ypixels,
+                    self.xpixels,
+                    min_size_px=mask_min_size_px,
+                    closing_radius_px=mask_closing_radius_px,
+                )
 
-        # Step 4: Adjust spectra to bring each spectrum min to zero
-        self.data = adjust_spectra_min_to_zero(self.data)
+        if min_to_zero:
+            self.data = adjust_spectra_min_to_zero(self.data)
+        if vector_normalize:
+            self.data = vector_norm(self.data)
 
-        # Step 5: Perform vector normalization
-        self.data = vector_norm(self.data)
+        if wavenumber_range is not None:
+            self = self.keep_range(*wavenumber_range)
 
-        # Step 6: Refine the wavenumber range to interest region
-        # data = data.keep_range(1000,1800)
-
-        # Step 7: Apply Savitzky-Golay derivative filter
-        if deriv > 0:
-            self = self.apply_derivative(deriv=deriv)
-
+        if deriv and deriv > 0:
+            self = self.apply_derivative(
+                window_length=sg_window,
+                polyorder=sg_polyorder,
+                deriv=deriv,
+                interp=sg_interp,
+            )
         return self
 
     @inplace_method
@@ -846,18 +983,25 @@ class SpectroscopicData:
 
         return combined_obj
 
-    def from_existing(self, new_data = None, wavenumbers = None, mask = None, labels = None, metadata = None) -> 'SpectroscopicData':
-        """
-        Creates a new SpectroscopicData instance from an existing one with new data.
+    def from_existing(self, new_data=None, wavenumbers=None, mask=None, labels=None, metadata=None) -> 'SpectroscopicData':
+        """Create a copy of this instance, optionally swapping fields.
+
+        Any field not passed defaults to a deep-enough copy of the current
+        value. Fields that are currently ``None`` stay ``None`` rather than
+        crashing on ``.copy()``.
         """
         new_instance = SpectroscopicData(inplace=self.inplace)
-        new_instance.data = new_data if new_data is not None else self.data.copy()
-        new_instance.wavenumbers = wavenumbers if wavenumbers is not None else self.wavenumbers.copy()
-        new_instance.mask = mask if mask is not None else self.mask.copy()
-        new_instance.metadata = metadata if metadata is not None else self.metadata.copy()
+        new_instance.data = new_data if new_data is not None else _copy_or_none(self.data)
+        new_instance.wavenumbers = (
+            wavenumbers if wavenumbers is not None else _copy_or_none(self.wavenumbers)
+        )
+        new_instance.mask = mask if mask is not None else _copy_or_none(self.mask)
+        new_instance.metadata = (
+            metadata if metadata is not None else _copy_or_none(self.metadata)
+        )
         new_instance.xpixels = self.xpixels
         new_instance.ypixels = self.ypixels
-        new_instance.labels = labels if labels is not None else (self.labels.copy() if self.labels is not None else None)
+        new_instance.labels = labels if labels is not None else _copy_or_none(self.labels)
         return new_instance
     
     def from_quality_control(self, clean_data, valid_indices) -> 'SpectroscopicData':

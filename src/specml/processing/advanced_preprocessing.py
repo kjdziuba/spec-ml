@@ -439,22 +439,22 @@ def kmeans_tissue_wax_separation(data, wavenumbers, n_clusters=3, amide_range=(1
         tuple: (tissue_mask, cluster_labels, amide_intensities)
     """
     from sklearn.cluster import KMeans
-    from scipy.integrate import trapz
-    
+    from scipy.integrate import trapezoid
+
     # Find Amide I region indices
     amide_mask = (wavenumbers >= amide_range[0]) & (wavenumbers <= amide_range[1])
     amide_indices = np.where(amide_mask)[0]
-    
+
     if len(amide_indices) == 0:
         logger.warning("No wavenumbers found in Amide I range")
         return np.ones(data.shape[0], dtype=bool), np.zeros(data.shape[0]), np.zeros(data.shape[0])
-    
+
     # Calculate integrated Amide I intensity for each spectrum
     amide_data = data[:, amide_indices]
     amide_wavenumbers = wavenumbers[amide_indices]
-    
-    # Integrate using trapezoidal rule
-    amide_intensities = np.array([trapz(spectrum, amide_wavenumbers) for spectrum in amide_data])
+
+    # Vectorised trapezoidal integration across all spectra at once.
+    amide_intensities = trapezoid(amide_data, amide_wavenumbers, axis=1)
     
     # Reshape for k-means (needs 2D input)
     features = amide_intensities.reshape(-1, 1)
