@@ -60,7 +60,13 @@ class AgilentMosaic:
         return struct.unpack('<d', binary_file.read(8))[0]
 
     def _readtile(self, filename):
-        tile = np.memmap(filename, dtype=self.datatype, mode='r')
+        # np.fromfile, not np.memmap. The caller immediately strided-assigns
+        # this tile into `alldata`, so the whole tile is materialised either
+        # way and memmap's laziness buys nothing -- while its page-fault
+        # pattern thrashes badly on external/USB storage. Measured on a
+        # LaCie USB drive, 49 MB tiles: 1993 ms/tile (memmap, cold) vs
+        # 470 ms/tile (fromfile, cold) = 4.25x. Output is bit-identical.
+        tile = np.fromfile(filename, dtype=self.datatype)
         # skip the (unknown) header
         tile = tile[255:]
         tile = np.reshape(tile, (self.numberofpoints, self.fpasize, self.fpasize))

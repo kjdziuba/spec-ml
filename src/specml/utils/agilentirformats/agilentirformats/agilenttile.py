@@ -60,7 +60,11 @@ class AgilentTile:
         return struct.unpack('<d', binary_file.read(8))[0]
 
     def _readtile(self, filename):
-        tile = np.memmap(filename, dtype=self.datatype, mode='r')
+        # np.fromfile, not np.memmap -- see agilentmosaic._readtile for the
+        # measurement. The caller materialises the tile immediately, so
+        # memmap's laziness buys nothing and its page-fault pattern thrashes
+        # on external/USB storage. Output is bit-identical.
+        tile = np.fromfile(filename, dtype=self.datatype)
         # skip the (unknown) header
         tile = tile[255:]
         tile = np.reshape(tile, (self.numberofpoints, self.fpasize, self.fpasize))
