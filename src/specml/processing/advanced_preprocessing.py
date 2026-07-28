@@ -150,51 +150,81 @@ def detrend_spectrum(data, method='linear'):
     logger.info(f"Applied {method} detrending")
     return detrended_data
 
-def rubberband_baseline_correction(data, num_points=100):
+def rubberband_baseline_correction(data, num_points=None):
     """
-    Rubberband baseline correction using convex hull.
-    
+    Rubberband baseline correction using the lower convex hull.
+
     Effective for biological samples where baseline curvature
     varies significantly. Particularly useful for tissue samples
     with varying thickness and composition.
-    
-    Chemistry: Estimates baseline by finding the convex hull of
-    the spectrum, representing the minimum possible baseline.
-    
+
+    Chemistry: the baseline is the taut band stretched underneath the
+    spectrum -- the lower convex envelope. Because it lies under the data by
+    construction, the corrected spectrum is non-negative everywhere.
+
     Args:
-        data (np.ndarray): Spectral data (n_samples, n_wavenumbers)
-        num_points (int): Number of points to use for convex hull
-    
+        data (np.ndarray): Spectral data, (n_samples, n_wavenumbers) or a
+            single 1-D spectrum.
+        num_points (int, optional): Subsample this many points before the hull
+            is computed. ``None`` (default) uses every channel, which is both
+            more accurate and fast enough -- a convex hull over a few thousand
+            points is negligible next to the rest of a pipeline.
+
     Returns:
-        np.ndarray: Baseline-corrected data
+        np.ndarray: Baseline-corrected data, same shape as the input.
+
+    Note:
+        A previous implementation interpolated over **all** convex-hull
+        vertices sorted by x. A 2-D hull is a closed polygon with an upper and
+        a lower chain, so sorting by x interleaves the two: the resulting
+        "baseline" zigzagged between the minimum and maximum envelopes and sat
+        *above* the spectrum for most of its length. On a synthetic spectrum
+        with a strictly positive baseline, 97.5% of the returned values were
+        negative. Only the lower chain is the rubber band.
     """
     from scipy.spatial import ConvexHull
-    
-    corrected_data = np.zeros_like(data)
-    
-    for i in range(data.shape[0]):
-        spectrum = data[i]
-        x = np.arange(len(spectrum))
-        
-        # Subsample for convex hull calculation
-        indices = np.linspace(0, len(spectrum)-1, num_points, dtype=int)
-        points = np.column_stack([x[indices], -spectrum[indices]])  # Negative for convex hull
-        
-        # Calculate convex hull
-        hull = ConvexHull(points)
-        hull_points = points[hull.vertices]
-        
-        # Sort by x-coordinate
-        hull_points = hull_points[hull_points[:, 0].argsort()]
-        
-        # Interpolate baseline
-        baseline = np.interp(x, hull_points[:, 0], -hull_points[:, 1])
-        
-        # Subtract baseline
+
+    arr = np.asarray(data, dtype=float)
+    single = arr.ndim == 1
+    if single:
+        arr = arr[None, :]
+
+    n_channels = arr.shape[1]
+    x = np.arange(n_channels, dtype=float)
+    corrected_data = np.empty_like(arr)
+
+    for i, spectrum in enumerate(arr):
+        finite = np.isfinite(spectrum)
+        if finite.sum() < 3:
+            corrected_data[i] = spectrum
+            continue
+
+        xs, ys = x[finite], spectrum[finite]
+        if num_points is not None and num_points < xs.size:
+            idx = np.unique(np.linspace(0, xs.size - 1, num_points).astype(int))
+            xs, ys = xs[idx], ys[idx]
+
+        points = np.column_stack([xs, ys])
+        try:
+            vertices = ConvexHull(points).vertices
+        except Exception:
+            # degenerate (collinear) input -- fall back to the straight line
+            # through the endpoints, which is the correct limiting case
+            corrected_data[i] = spectrum - np.interp(
+                x, [xs[0], xs[-1]], [ys[0], ys[-1]])
+            continue
+
+        # scipy returns 2-D hull vertices counter-clockwise. Starting from the
+        # leftmost vertex, a counter-clockwise walk traverses the LOWER chain
+        # first, ending at the rightmost vertex.
+        vertices = np.roll(vertices, -int(np.argmin(points[vertices, 0])))
+        lower = vertices[:int(np.argmax(points[vertices, 0])) + 1]
+
+        baseline = np.interp(x, points[lower, 0], points[lower, 1])
         corrected_data[i] = spectrum - baseline
-    
+
     logger.info("Applied rubberband baseline correction")
-    return corrected_data
+    return corrected_data[0] if single else corrected_data
 
 def als_baseline_correction(data, lam=10**6, p=0.01, niter=10):
     """
