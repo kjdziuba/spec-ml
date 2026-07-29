@@ -54,7 +54,12 @@ class AgilentTile:
             return False
 
     def _readwinint32(self, binary_file):
-        return int.from_bytes(binary_file.read(4), byteorder='little')
+        # SIGNED. These fields can legitimately be negative, and reading them
+        # unsigned turns -132 into 4294967164. The caller then builds
+        # np.arange(1, numberofpoints + startwavenumber), i.e. asks for tens
+        # of gigabytes, and the process is SIGKILLed with no traceback.
+        return int.from_bytes(binary_file.read(4), byteorder='little',
+                              signed=True)
 
     def _readwindouble(self, binary_file):
         return struct.unpack('<d', binary_file.read(8))[0]
@@ -85,6 +90,8 @@ class AgilentTile:
             self.wavenumberstep = self._readwindouble(binary_file)
             # print(self.wavenumberstep)
 
+            self._validate_axis()
+
             stopwavenumber = self.startwavenumber + (self.wavenumberstep * self.numberofpoints)
 
             self.wavenumbers = np.arange(1, self.numberofpoints + self.startwavenumber)
@@ -97,6 +104,34 @@ class AgilentTile:
             # regex = re.compile(b"Time Stamp.{44}\w+, (\w+) (\d\d), (\d\d\d\d) (\d\d):(\d\d):(\d\d)")
             # matches = re.match(regex, contents)
             # matches2 = re.match(b'(T)', contents)
+
+    def _validate_axis(self):
+        """Reject a header that does not describe a stored spectrum.
+
+        Some acquisitions leave INTERFEROGRAM parameters in the file the
+        loader reads for the spectral axis -- observed on four pieces of the
+        rat-lung set as ``startwavenumber = -132, numberofpoints = 1041,
+        wavenumberstep = 1.266e-4`` (1041 optical-path samples at 1.266 um,
+        the 4x undersampled HeNe step). Building the wavenumber array from
+        those values allocates tens of gigabytes and the process dies to the
+        OOM killer with no traceback, which is impossible to diagnose from
+        the outside. Fail loudly and early instead.
+
+        A sibling ``*_bkgd.bsp`` usually carries the correct axis, so the data
+        is recoverable -- point the reader at that file.
+        """
+        start, npts = self.startwavenumber, self.numberofpoints
+        step = self.wavenumberstep
+        ok = (0 < start < 100000 and 16 < npts < 100000
+              and 0.05 < step < 1000.0)
+        if not ok:
+            raise ValueError(
+                f"{self.fstub}: header does not describe a spectral axis "
+                f"(startwavenumber={start}, numberofpoints={npts}, "
+                f"wavenumberstep={step:g}). These look like interferogram-"
+                f"domain parameters. Try the sibling '{self.fstub}_bkgd.bsp', "
+                f"which normally holds the correct axis."
+            )
 
     def _getfpasize(self):
         tilefilename = os.path.join(self.fpath, (self.fstub + ".dat"))
