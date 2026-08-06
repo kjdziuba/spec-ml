@@ -526,13 +526,30 @@ class SpectroscopicData:
             self.data = apply_mask(self.data, tissue_mask)
             self.mask = rebuild_tissue_mask(self, tissue_mask)
             if mask_min_size_px or mask_closing_radius_px:
-                self.mask = clean_tissue_mask_spatial(
-                    self.mask,
-                    self.ypixels,
-                    self.xpixels,
-                    min_size_px=mask_min_size_px,
-                    closing_radius_px=mask_closing_radius_px,
-                )
+                old_mask = np.asarray(self.mask).astype(bool)
+                new_mask = np.asarray(
+                    clean_tissue_mask_spatial(
+                        self.mask,
+                        self.ypixels,
+                        self.xpixels,
+                        min_size_px=mask_min_size_px,
+                        closing_radius_px=mask_closing_radius_px,
+                    )
+                ).astype(bool)
+                # Keep self.data and self.mask consistent. self.data was just
+                # compressed to the active pixels of old_mask (row i <-> the i-th
+                # True in old_mask). The spatial cleanup drops pixels
+                # (remove_small_objects) and can, via closing, add hole pixels
+                # that were never extracted into self.data. A pixel can only stay
+                # active if it actually has a spectrum, so intersect with the
+                # extraction mask and trim self.data to the survivors. Without
+                # this trim self.data keeps rows for removed pixels and silently
+                # desyncs from self.mask (data rows > mask active), which breaks
+                # any downstream re-expansion of spectra back onto the pixel grid.
+                new_mask = new_mask & old_mask
+                keep = new_mask.ravel()[np.flatnonzero(old_mask.ravel())]
+                self.data = self.data[keep]
+                self.mask = new_mask
 
         if min_to_zero:
             self.data = adjust_spectra_min_to_zero(self.data)
